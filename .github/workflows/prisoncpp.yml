@@ -1,209 +1,50 @@
-name: native builds
+name: request client release
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: release version, such as v0.1.0
+        type: string
+        required: true
+      source_ref:
+        description: branch or tag in the private source repository
+        type: string
+        default: main
+        required: true
 
-permissions:
-  contents: read
-
-concurrency:
-  group: native-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+permissions: {}
 
 jobs:
-  prepare:
+  request:
     runs-on: ubuntu-22.04
-    outputs:
-      version: ${{ steps.version.outputs.version }}
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: package version
-        id: version
-        shell: bash
-        run: |
-          version=$(cat VERSION)
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
-            if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-              echo 'release tags must use v0.0.0' >&2
-              exit 1
-            fi
-            version="${GITHUB_REF_NAME#v}"
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-  unix:
-    needs: prepare
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            name: linux-x64
-          - os: macos-15
-            name: macos-arm64
-          - os: macos-15-intel
-            name: macos-x64
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config libsdl2-dev libgl-dev libfreetype-dev libpng-dev libjsoncpp-dev libcurl4-openssl-dev xvfb dpkg-dev
-      - name: macos dependencies
-        if: runner.os == 'macOS'
-        run: |
-          brew install ninja pkg-config sdl2 freetype libpng jsoncpp curl
-          echo "PKG_CONFIG_PATH=$(brew --prefix curl)/lib/pkgconfig" >> "$GITHUB_ENV"
-      - name: audit data
-        run: python3 tools/check_data.py
-      - name: build
+      - name: request private build
         env:
-          PRISON_VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPRISON_VERSION="$PRISON_VERSION"
-          cmake --build build --parallel 2
-      - name: core checks
-        run: ctest --test-dir build --output-on-failure
-      - name: graphical checks
-        if: runner.os == 'Linux'
-        env:
-          LIBGL_ALWAYS_SOFTWARE: "1"
-        run: xvfb-run -a ./build/ui_test "$GITHUB_WORKSPACE/build" "$RUNNER_TEMP/ui-checks"
-      - name: install and package
-        run: |
-          cmake --install build --prefix "$RUNNER_TEMP/prisontest"
-          cpack --config build/CPackConfig.cmake -B build/packages
-      - name: installed client check
-        env:
-          PACKAGE_ROOT: ${{ runner.temp }}/prisontest
-        run: |
-          if [ "${{ runner.os }}" = macOS ]; then
-            executable="$PACKAGE_ROOT/prisontest.app/Contents/MacOS/prisontest"
-          else
-            executable="$PACKAGE_ROOT/bin/prisoncpp"
-          fi
-          cd "$RUNNER_TEMP"
-          "$executable" --headless --save-dir "$RUNNER_TEMP/native-check/saves" --dev --command '/givecrystal 2 1 token 10'
-      - name: upload packages
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: prisontest-${{ matrix.name }}
-          path: |
-            build/packages/*.tar.gz
-            build/packages/*.deb
-            build/packages/*.zip
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-
-  windows:
-    needs: prepare
-    name: windows-x64
-    runs-on: windows-2022
-    timeout-minutes: 30
-    defaults:
-      run:
-        shell: msys2 {0}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
-        with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            git
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-cmake
-            mingw-w64-ucrt-x86_64-ninja
-            mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-python
-            mingw-w64-ucrt-x86_64-SDL2
-            mingw-w64-ucrt-x86_64-freetype
-            mingw-w64-ucrt-x86_64-libpng
-            mingw-w64-ucrt-x86_64-jsoncpp
-            mingw-w64-ucrt-x86_64-curl
-      - name: audit data and build
-        env:
-          PRISON_VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          python3 tools/check_data.py
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPRISON_VERSION="$PRISON_VERSION"
-          cmake --build build --parallel 2
-          ctest --test-dir build --output-on-failure
-      - name: install and package
-        run: |
-          cmake --install build --prefix "$RUNNER_TEMP/prisontest"
-          cpack --config build/CPackConfig.cmake -B build/packages
-      - name: installed client without msys on path
-        shell: pwsh
-        run: |
-          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
-          Set-Location $env:RUNNER_TEMP
-          & "$env:RUNNER_TEMP/prisontest/bin/prisoncpp.exe" --headless --save-dir "$env:RUNNER_TEMP/native-check/saves" --dev --command '/givecrystal 2 1 token 10'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: upload package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: prisontest-windows-x64
-          path: build/packages/*.zip
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-
-  release:
-    needs: [unix, windows]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.event.repository.private
-    runs-on: ubuntu-22.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: prisontest-*
-          path: artifacts
-      - name: prepare public packages
-        run: python3 tools/prepare_release.py "$GITHUB_REF_NAME" artifacts release
-      - name: publish to downloads repository
-        env:
-          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
-          PUBLIC_RELEASE_REPO: ${{ vars.PUBLIC_RELEASE_REPO || 'prisontest/prisontest-client' }}
+          GH_TOKEN: ${{ secrets.SOURCE_BUILD_TOKEN }}
+          SOURCE_REPOSITORY: ${{ secrets.SOURCE_REPOSITORY }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         shell: bash
         run: |
           set -euo pipefail
-          : "${GH_TOKEN:?set RELEASES_TOKEN with contents write access to the public downloads repository}"
-          if [[ ! "$PUBLIC_RELEASE_REPO" =~ ^[a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+$ || "$PUBLIC_RELEASE_REPO" == "$GITHUB_REPOSITORY" ]]; then
-            echo 'use a separate public downloads repository' >&2
+          : "${GH_TOKEN:?set SOURCE_BUILD_TOKEN with actions write access to the private source repository}"
+          : "${SOURCE_REPOSITORY:?set SOURCE_REPOSITORY to the private owner/repository}"
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ || ${#RELEASE_TAG} -gt 40 ]]; then
+            echo 'release tags must use v0.0.0' >&2
             exit 1
           fi
-          if [[ "$(gh api "repos/$PUBLIC_RELEASE_REPO" --jq .private)" != false ]]; then
-            echo 'the downloads repository must be public' >&2
+          if [[ ! "$SOURCE_REPOSITORY" =~ ^[a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+$ || -z "$SOURCE_REF" ]]; then
+            echo 'set a valid source repository and ref' >&2
             exit 1
           fi
-          if gh release view "$GITHUB_REF_NAME" --repo "$PUBLIC_RELEASE_REPO" --json isDraft > release/current.json; then
-            if [[ "$(jq -r .isDraft release/current.json)" != true ]]; then
-              echo 'this release is already published; keeping its packages unchanged'
-              exit 0
-            fi
-          else
-            gh release create "$GITHUB_REF_NAME" --repo "$PUBLIC_RELEASE_REPO" --draft \
-              --title "prisontest $GITHUB_REF_NAME" --notes-file release/notes.md
+          if [[ "$(gh api "repos/$SOURCE_REPOSITORY" --jq .private)" != true ]]; then
+            echo 'the source repository must be private' >&2
+            exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" release/assets/* --repo "$PUBLIC_RELEASE_REPO" --clobber
-          gh release edit "$GITHUB_REF_NAME" --repo "$PUBLIC_RELEASE_REPO" --draft=false --latest
+          jq -n --arg ref "$SOURCE_REF" --arg tag "$RELEASE_TAG" \
+            '{ref: $ref, inputs: {release_tag: $tag}}' > "$RUNNER_TEMP/build-request.json"
+          gh api --method POST "repos/$SOURCE_REPOSITORY/actions/workflows/prisoncpp.yml/dispatches" \
+            --input "$RUNNER_TEMP/build-request.json" --silent
+          echo 'private build requested; packages appear in releases after all platform checks pass'
